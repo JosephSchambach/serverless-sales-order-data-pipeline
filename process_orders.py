@@ -5,7 +5,9 @@ import time
 
 load_dotenv()
 
-BUCKET_PATH = os.getenv("BUCKET_PATH")
+BUCKET_PATH = os.getenv("RAW_BUCKET_PATH")
+PROCESSED_PATH = os.getenv("PROCESSED_PATH")
+REJECTED_PATH = os.getenv("REJECTED_PATH")
 SCHEMA = os.getenv("SCHEMA").split(",")
 required_fields = os.getenv("REQUIRED_FIELDS").split(",")
 
@@ -21,7 +23,6 @@ for file in os.listdir(BUCKET_PATH):
     
     df["processed_at"] = pd.Timestamp.now()
     df["source_file"] = file
-
 
     schema = df.dtypes
     print("SCHEMA:")
@@ -56,30 +57,51 @@ def validate_rows(df, required_fields):
     if (df["discount_pct"] < 0).any() or (df["discount_pct"] > 100).any() or (df["discount_pct"].isna().any()):
         return False, "Invalid discount percentage"
     
+    # check for invalid refund amount, unit price, and shipping cost
+    for field in ["refund_amount", "unit_price", "shipping_cost"]:
+        if field not in df.columns or df[field].isna().any() or (df[field] < 0).any():
+            return False, f"Invalid {field}"
+    
     return True, "Valid rows"
+
+def transform_orders(df):
+    # add a new column "net" to calculate the net order amount after discount and shipping cost and refund amount
+    df["net"] = df.apply(
+        lambda row: (
+            row["unit_price"] * row["quantity"]
+            - row["unit_price"] * row["quantity"] * row["discount_pct"]
+            + row["shipping_cost"]
+            - row["refund_amount"]
+        ),
+        axis=1,
+    )
+    df["net"] = df["net"].round(2)
+    
+    # add a new column "gross_total" to store the original order total before discount and shipping cost
+    df["gross_total"] = (df["unit_price"] * df["quantity"]).round(2)
+    
+    # process date fields
+    df["processed_at"] = pd.Timestamp.now()
+    df["ordered_at"] = pd.to_datetime(df["ordered_at"])
+    df["estimated_delivery_date"] = df["ordered_at"] + pd.to_timedelta(df["days_to_deliver"], unit="d")
+    
+    return df
 
 schema_passed, schema_message = validate_schema(final_df, SCHEMA)
 fields_passed, fields_message = validate_rows(final_df, required_fields)
+final_df = transform_orders(final_df)
+
+today = time.strftime("%Y-%m-%d")
 
 if (
     schema_passed and fields_passed
 ):
     print("Valid dataframe")
+    final_df.to_parquet(f"{PROCESSED_PATH}{today}/processed_orders.parquet")
 else:
     print("Rejected dataframe")
+    final_df.to_parquet(f"{REJECTED_PATH}{today}/rejected_orders.parquet")
     if not schema_passed:
         print(f"Schema validation failed: {schema_message}")
     if not fields_passed:
         print(f"Rows validation failed: {fields_message}")
-
-# final_df["net"] = final_df.apply(
-#     lambda row: (
-#         row["unit_price"] * row["quantity"]
-#         - row["unit_price"] * row["quantity"] * row["discount_pct"] / 100
-#         + row["shipping_cost"]
-#         if row["processed_status"] == "accept"
-#         else pd.NA
-#     ),
-#     axis=1,
-# )
-
