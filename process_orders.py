@@ -1,47 +1,85 @@
 import pandas as pd
 from dotenv import load_dotenv
 import os 
+import time
 
 load_dotenv()
 
-bucket_path = os.getenv("BUCKET_PATH")
+BUCKET_PATH = os.getenv("BUCKET_PATH")
+SCHEMA = os.getenv("SCHEMA").split(",")
+required_fields = os.getenv("REQUIRED_FIELDS").split(",")
 
-df = pd.read_parquet(
-    path=bucket_path,
-    engine="fastparquet"
-)
+final_df = pd.DataFrame()
 
-today = pd.Timestamp.now().strftime("%Y-%m-%d")
+for file in os.listdir(BUCKET_PATH):
+    file_to_process = os.path.join(BUCKET_PATH, file)
 
-schema = df.dtypes
-print("SCHEMA:")
-print(schema)
-print("ROWS:")
-print(df.shape[0])
-
-
-required_fields = ["order_id", "customer_id", "ordered_at", "product_sku", "status", "unit_price", "quantity", "discount_pct", "shipping_cost", "currency"]
-
-def set_processed_status(df):
-    missing_fields = df[required_fields].isna().any(axis=1)
-    df["processed_status"] = missing_fields.map({True: "reject", False: "accept"})
-    return df
+    df = pd.read_parquet(
+        path=file_to_process,
+        engine="fastparquet"
+    )
+    
+    df["processed_at"] = pd.Timestamp.now()
+    df["source_file"] = file
 
 
-set_processed_status(df)
+    schema = df.dtypes
+    print("SCHEMA:")
+    print(schema)
+    print("ROWS:")
+    print(df.shape[0])
+    
+    final_df = pd.concat([final_df, df], ignore_index=True)
 
-df["net"] = df.apply(
-    lambda row: (
-        row["unit_price"] * row["quantity"]
-        - row["unit_price"] * row["quantity"] * row["discount_pct"] / 100
-        + row["shipping_cost"]
-        if row["processed_status"] == "accept"
-        else pd.NA
-    ),
-    axis=1,
-)
+def validate_schema(df, schema):
+    # check for missing required fields in the schema
+    missing_fields = [field for field in schema if field not in df.columns]
+    if missing_fields:
+        return False, f"Missing required fields in schema: {missing_fields}"
+    
+    return True, "Valid schema"
 
-print("NUM ACCEPTED: ", (df["processed_status"] == "accept").sum())
-print("NUM REJECTED: ", (df["processed_status"] == "reject").sum())
-print("NUM NA: ", df["net"].isna().sum())
+def validate_rows(df, required_fields):
+    # check for rows missing required fields
+    if df[required_fields].isna().any(axis=1).any():
+        return False, "Missing required fields"
+    
+    # check for invalid quantity
+    if (df["quantity"] <= 0).any() or (df["quantity"].isna().any()) or (df["quantity"].dtype not in  ["int32", "int64"]):
+        return False, "Invalid quantity"
+    
+    # check for missing timestamp
+    if df["ordered_at"].isna().any():
+        return False, "Missing timestamp"
+    
+    # check for invalid discount percentage
+    if (df["discount_pct"] < 0).any() or (df["discount_pct"] > 100).any() or (df["discount_pct"].isna().any()):
+        return False, "Invalid discount percentage"
+    
+    return True, "Valid rows"
+
+schema_passed, schema_message = validate_schema(final_df, SCHEMA)
+fields_passed, fields_message = validate_rows(final_df, required_fields)
+
+if (
+    schema_passed and fields_passed
+):
+    print("Valid dataframe")
+else:
+    print("Rejected dataframe")
+    if not schema_passed:
+        print(f"Schema validation failed: {schema_message}")
+    if not fields_passed:
+        print(f"Rows validation failed: {fields_message}")
+
+# final_df["net"] = final_df.apply(
+#     lambda row: (
+#         row["unit_price"] * row["quantity"]
+#         - row["unit_price"] * row["quantity"] * row["discount_pct"] / 100
+#         + row["shipping_cost"]
+#         if row["processed_status"] == "accept"
+#         else pd.NA
+#     ),
+#     axis=1,
+# )
 
